@@ -1,0 +1,24 @@
+{
+  "name": "bashtutor",
+  "version": "1.0.0",
+  "description": "Visualiseur d'exécution Bash façon Python Tutor (100% navigateur)",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node --test tests/engine.test.mjs"
+  },
+  "dependencies": {
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/legacy-modes": "^6.5.3",
+    "@everruns/bashkit-wasm": "^0.17.1",
+    "codemirror": "^6.0.2",
+    "web-tree-sitter": "^0.26.13"
+  },
+  "devDependencies": {
+    "tree-sitter-bash": "^0.25.1",
+    "vite": "^8.2.2"
+  }
+}

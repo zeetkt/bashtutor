@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bash Tutor — visualiseur d'exécution Bash</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Bash&nbsp;Tutor</h1>
+      <label class="examples-label">Exemple&nbsp;:
+        <select id="example-select"></select>
+      </label>
+      <button id="run-btn" class="btn primary">Visualiser l'exécution</button>
+      <span id="status" class="status"></span>
+    </header>
+
+    <main class="grid">
+      <section class="panel editor-panel">
+        <div class="panel-title">Script Bash</div>
+        <div id="editor" class="editor-host"></div>
+      </section>
+
+      <section class="panel code-panel">
+        <div class="panel-title">Exécution pas à pas</div>
+        <div id="code" class="code-scroll"></div>
+        <div id="current-stmt" class="current-stmt"></div>
+      </section>
+
+      <section class="panel side-panel">
+        <div class="side-tabs">
+          <button class="side-tab active" data-tab="vars">Variables</button>
+          <button class="side-tab" data-tab="context">Contexte</button>
+          <button class="side-tab" data-tab="output">Sortie</button>
+        </div>
+        <div id="vars" class="side-pane active vars-scroll"></div>
+        <div id="context" class="side-pane vars-scroll"></div>
+        <div id="output" class="side-pane out-scroll"></div>
+      </section>
+    </main>
+
+    <footer class="controls">
+      <button id="btn-first" title="Première étape">&#9198;</button>
+      <button id="btn-back" title="Étape précédente (←)">&#9664;</button>
+      <span id="counter" class="counter">0 / 0</span>
+      <button id="btn-next" title="Étape suivante (→)">&#9654;</button>
+      <button id="btn-last" title="Dernière étape">&#9197;</button>
+      <button id="btn-play" class="btn">Lecture</button>
+      <label class="speed-label">Vitesse&nbsp;:
+        <select id="speed">
+          <option value="1800">lente</option>
+          <option value="1000" selected>normale</option>
+          <option value="350">rapide</option>
+        </select>
+      </label>
+      <span id="errbanner" class="errbanner"></span>
+    </footer>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
