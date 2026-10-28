@@ -22,6 +22,11 @@ function formatValue(v) {
   return quote(v.value);
 }
 
+function shortValue(v, size = 26) {
+  const text = formatValue(v);
+  return text.length > size ? text.slice(0, size - 1) + "…" : text;
+}
+
 function badges(v) {
   const parts = [KIND_LABEL[v.kind] || v.kind];
   if (v.readonly) parts.push("lecture seule");
@@ -58,6 +63,36 @@ export function renderVariables(container, vars, prevVars) {
     .join("");
 
   container.innerHTML = rows + removedRows;
+}
+
+export function renderExplanation(container, prevVars, step) {
+  if (!step) {
+    container.textContent = "";
+    return;
+  }
+  const parts = [];
+  if (step.kind === "condition") {
+    parts.push(
+      `<span class="tag ${step.success ? "ok" : "ko"}">condition ${step.success ? "vraie" : "fausse"}</span>`,
+    );
+  }
+  const vars = step.vars || {};
+  const prev = prevVars || {};
+  const diff = computeVarDiff(prev, vars);
+  for (const name of diff.added) {
+    parts.push(
+      `<span class="chg added"><b>${escapeHtml(name)}</b> = ${escapeHtml(shortValue(vars[name]))}</span>`,
+    );
+  }
+  for (const name of diff.changed) {
+    parts.push(
+      `<span class="chg changed"><b>${escapeHtml(name)}</b> : ${escapeHtml(shortValue(prev[name]))} → ${escapeHtml(shortValue(vars[name]))}</span>`,
+    );
+  }
+  for (const name of diff.removed) {
+    parts.push(`<span class="chg removed"><b>${escapeHtml(name)}</b> supprimée</span>`);
+  }
+  container.innerHTML = parts.join("");
 }
 
 export function renderContext(container, step) {

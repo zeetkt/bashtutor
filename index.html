@@ -3,58 +3,68 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Visualiseur d'exécution Bash pas à pas, façon Python Tutor : variables, contexte et sortie à chaque commande, 100 % dans le navigateur."
+    />
     <title>Bash Tutor — visualiseur d'exécution Bash</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
     <header class="topbar">
       <h1>Bash&nbsp;Tutor</h1>
-      <label class="examples-label">Exemple&nbsp;:
-        <select id="example-select"></select>
-      </label>
-      <button id="run-btn" class="btn primary">Visualiser l'exécution</button>
-      <span id="status" class="status"></span>
+      <label class="examples-label" for="example-select">Exemple</label>
+      <select id="example-select"></select>
+      <button id="run-btn" class="btn primary" type="button">Visualiser l'exécution</button>
+      <button id="share-btn" class="btn" type="button" title="Copier un lien vers ce script">Partager</button>
+      <button id="theme-btn" class="btn icon" type="button" aria-label="Activer le thème sombre" title="Thème clair / sombre">◐</button>
+      <span id="status" class="status" role="status" aria-live="polite"></span>
     </header>
 
     <main class="grid">
-      <section class="panel editor-panel">
-        <div class="panel-title">Script Bash</div>
+      <section class="panel editor-panel" aria-labelledby="editor-title">
+        <div class="panel-title" id="editor-title">Script Bash</div>
         <div id="editor" class="editor-host"></div>
       </section>
 
-      <section class="panel code-panel">
-        <div class="panel-title">Exécution pas à pas</div>
-        <div id="code" class="code-scroll"></div>
-        <div id="current-stmt" class="current-stmt"></div>
+      <section class="panel code-panel" aria-labelledby="code-title">
+        <div class="panel-title" id="code-title">Exécution pas à pas</div>
+        <div id="code" class="code-scroll" role="group" aria-label="Script exécuté pas à pas"></div>
+        <div id="current-stmt" class="current-stmt" aria-live="polite"></div>
+        <div id="explain" class="explain" aria-live="polite"></div>
       </section>
 
-      <section class="panel side-panel">
-        <div class="side-tabs">
-          <button class="side-tab active" data-tab="vars">Variables</button>
-          <button class="side-tab" data-tab="context">Contexte</button>
-          <button class="side-tab" data-tab="output">Sortie</button>
+      <section class="panel side-panel" aria-label="État de l'exécution">
+        <div class="side-tabs" role="tablist" aria-label="Panneaux d'état">
+          <button class="side-tab active" id="tab-vars" type="button" role="tab" aria-selected="true" aria-controls="vars" data-tab="vars">Variables</button>
+          <button class="side-tab" id="tab-context" type="button" role="tab" aria-selected="false" aria-controls="context" data-tab="context" tabindex="-1">Contexte</button>
+          <button class="side-tab" id="tab-output" type="button" role="tab" aria-selected="false" aria-controls="output" data-tab="output" tabindex="-1">Sortie</button>
         </div>
-        <div id="vars" class="side-pane active vars-scroll"></div>
-        <div id="context" class="side-pane vars-scroll"></div>
-        <div id="output" class="side-pane out-scroll"></div>
+        <div id="vars" class="side-pane active vars-scroll" role="tabpanel" aria-labelledby="tab-vars" tabindex="0"></div>
+        <div id="context" class="side-pane vars-scroll" role="tabpanel" aria-labelledby="tab-context" tabindex="0" hidden></div>
+        <div id="output" class="side-pane out-scroll" role="tabpanel" aria-labelledby="tab-output" tabindex="0" hidden></div>
       </section>
     </main>
 
     <footer class="controls">
-      <button id="btn-first" title="Première étape">&#9198;</button>
-      <button id="btn-back" title="Étape précédente (←)">&#9664;</button>
-      <span id="counter" class="counter">0 / 0</span>
-      <button id="btn-next" title="Étape suivante (→)">&#9654;</button>
-      <button id="btn-last" title="Dernière étape">&#9197;</button>
-      <button id="btn-play" class="btn">Lecture</button>
-      <label class="speed-label">Vitesse&nbsp;:
+      <div class="nav-group">
+        <button id="btn-first" type="button" title="Première étape (Début)" aria-label="Première étape">&#9198;</button>
+        <button id="btn-back" type="button" title="Étape précédente (←)" aria-label="Étape précédente">&#9664;</button>
+        <span id="counter" class="counter" aria-live="polite">0 / 0</span>
+        <button id="btn-next" type="button" title="Étape suivante (→)" aria-label="Étape suivante">&#9654;</button>
+        <button id="btn-last" type="button" title="Dernière étape (Fin)" aria-label="Dernière étape">&#9197;</button>
+      </div>
+      <input id="scrubber" class="scrubber" type="range" min="0" max="0" value="0" step="1" aria-label="Position dans l'exécution" />
+      <button id="btn-play" class="btn" type="button" aria-pressed="false">Lecture</button>
+      <label class="speed-label" for="speed">Vitesse
         <select id="speed">
           <option value="1800">lente</option>
           <option value="1000" selected>normale</option>
           <option value="350">rapide</option>
         </select>
       </label>
-      <span id="errbanner" class="errbanner"></span>
+      <span id="errbanner" class="errbanner" role="status" aria-live="polite"></span>
     </footer>
 
     <script type="module" src="/src/main.js"></script>
