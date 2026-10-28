@@ -20,13 +20,12 @@ Ce document décrit le fonctionnement interne de Bash Tutor, du script source ju
                                 │ + BLLOG (fichiers)    │                │
                                 └───────────┬───────────┘                │
                                             │                            │
-                                  splitByMarkers +                       │
-                                  parseAfterBlock                        │
+                                  parseStream + parseAfterBlock          │
                                             │                            │
                                             └──────────── steps[] ───────┘
 ```
 
-Le cœur du défi : **bashkit-wasm n'expose pas de point d'arrêt ni d'API de lecture d'état en cours d'exécution**. `executeSync(script)` exécute tout d'un coup et renvoie `{ stdout, stderr, exitCode }`. On ne peut donc pas « avancer commande par commande » en appelant `executeSync` à chaque fois — l'état (variables, VFS) **ne persiste pas** entre deux appels `executeSync`.
+Le cœur du défi : **bashkit-wasm n'expose pas de point d'arrêt ni d'API de lecture d'état en cours d'exécution**. `executeSync(script)` exécute tout d'un coup et renvoie `{ stdout, stderr, exitCode }`. On ne peut donc pas « avancer commande par commande » en appelant `executeSync` à chaque fois — l'état (variables, VFS) **ne persiste pas** entre deux appels.
 
 La solution : **instrumenter le script** en injectant des sondes autour de chaque commande, exécuter le tout en un seul appel, puis reconstruire les étapes depuis les journaux.
 
@@ -53,6 +52,8 @@ Conclusion : la seule voie fiable est d'injecter manuellement, à chaque command
 
 tree-sitter-bash produit un AST. On le parcourt pour trouver les « commandes exécutables » — les nœuds qui correspondent à une unité d'exécution atomique.
 
+Chaque nœud retenu reçoit un **`id`** (son rang dans le parcours, en ordre de document) et un **`kind`** (`command` ou `condition`). Le moteur ne transmet que cet `id` au script instrumenté : le texte et les bornes de lignes sont relus depuis l'AST au moment de la reconstruction, ce qui garantit un libellé exact même pour `a=1; b=2`, une commande multi-ligne ou un `for …; do …; done` sur une ligne.
+
 ### Types de nœuds marqués (STEP_TYPES)
 
 On marque le nœud **et on ne descend pas** dans ses enfants (il est atomique) :
@@ -63,7 +64,19 @@ On marque le nœud **et on ne descend pas** dans ses enfants (il est atomique) :
 | `variable_assignment` | `x=5`, `arr=(a b c)` | Une affectation simple = une étape. |
 | `declaration_command` | `declare -A m=([k]=v)`, `export x=5` | **Atomique et crucial** : si on marquait l'enfant `variable_assignment` (qui commence au nom, après `declare -A`), la sonde s'insérerait entre `declare -A` et le nom → le tableau deviendrait indexé. |
 | `pipeline` | `cmd1 \| cmd2` | Un pipeline est une étape (on ne détaille pas chaque maillon). |
-| `list` | `a && b`, `a \|\| b`, `a ; b` | Une liste `&&`/`||` est une étape (préserve le court-circuit). |
+| `list` | `a && b`, `a \|\| b` | Une liste `&&`/`||` est une étape (préserve le court-circuit ; la découper casserait la sémantique). |
+
+### Conditions (CONDITION_PARENTS)
+
+Les conditions de `if` / `elif` / `while` / `until` produisent une étape de type `condition` (affichée « vraie » ou « fausse » dans l'UI) :
+
+| Parent | Condition retenue |
+|---|---|
+| `if_statement` | champ `condition` |
+| `while_statement` (aussi `until`) | champ `condition` |
+| `elif_clause` | **pas de champ** : on prend le premier enfant nommé (`elif` n'est pas un nœud nommé) |
+
+On saute ensuite la condition dans la boucle d'enfants pour ne pas la marquer deux fois.
 
 ### Types de nœuds sautés (SKIP_TYPES)
 
@@ -71,31 +84,40 @@ On **n'instrumente jamais** à l'intérieur de ces nœuds (on ne descend pas, on
 
 | Type | Raison |
 |---|---|
-| `function_definition` | Le corps d'une fonction n'est exécuté qu'à l'appel. Si on l'instrumentait, `r=$(mafonction)` capturerait les marqueurs internes → `r` vaudrait `__BTM_…`. Un appel de fonction reste une étape atomique. |
+| `function_definition` | Le corps d'une fonction n'est exécuté qu'à l'appel. Si on l'instrumentait, `r=$(mafonction)` capturerait les marqueurs internes. Un appel de fonction reste une étape atomique. |
 | `command_substitution` | `$(…)` : idem, les marqueurs internes pollueraient la valeur capturée. |
 | `process_substitution` | `<(…)` : même problème. |
 | `subshell` | `( … )` : même problème. |
 
 ### Types conteneurs (ni STEP ni SKIP)
 
-`for_statement`, `while_statement`, `if_statement`, `case_item`, `do_group`, `compound_statement`, etc. : on **descend** dedans pour trouver les commandes enfants. C'est ce qui permet à une boucle de produire une étape par itération (le corps `do_group` contient les commandes qu'on marque).
+`for_statement`, `case_item`, `do_group`, `compound_statement`, etc. : on **descend** dedans pour trouver les commandes enfants. C'est ce qui permet à une boucle de produire une étape par itération.
 
 ### Algorithme de parcours
 
 ```js
 function walkSteps(node, out) {
-  if (SKIP_TYPES.has(node.type)) return;        // ne pas descendre
-  if (STEP_TYPES.has(node.type)) {              // atomique : marquer, ne pas descendre
-    out.push({ startIndex, endIndex, startLine, endLine, type });
+  if (SKIP_TYPES.has(node.type)) return;
+  if (CONDITION_PARENTS.has(node.type)) {
+    const condition = conditionNode(node);
+    if (condition) out.push(stepNode(condition, "condition"));
+    for (const child of node.namedChildren) {
+      if (child.equals(condition)) continue;
+      walkSteps(child, out);
+    }
     return;
   }
-  for (const c of node.namedChildren) walkSteps(c, out);  // conteneur : descendre
+  if (STEP_TYPES.has(node.type)) {
+    out.push(stepNode(node, "command"));
+    return;
+  }
+  for (const child of node.namedChildren) walkSteps(child, out);
 }
 ```
 
 ### Détection d'erreurs — `firstErrorLine`
 
-Si `root.hasError`, on parcourt l'arbre à la recherche des nœuds `ERROR` ou manquants, on trie par ligne, et on renvoie la première ligne d'erreur. Le moteur court-circuite alors (pas d'exécution) et l'UI affiche l'erreur.
+Si `root.hasError`, on parcourt l'arbre à la recherche des nœuds `ERROR` ou manquants, on trie par ligne, et on renvoie la première ligne d'erreur. Le moteur court-circuite alors (pas d'exécution) et l'UI surligne cette ligne dans l'éditeur et dans la trace.
 
 ## Le moteur — instrumentation (src/engine.js)
 
@@ -103,66 +125,79 @@ Si `root.hasError`, on parcourt l'arbre à la recherche des nœuds `ERROR` ou ma
 
 | Nom | Valeur | Rôle |
 |---|---|---|
-| `MARK` | `__BTM_9F3K__` | Préfixe des marqueurs dans stdout/stderr (suffisamment unique pour ne pas collisionner avec du contenu utilisateur). |
-| `LOG` | `/tmp/__bt_log_9F3K.log` | Fichier des instantanés de variables (un bloc par commande). |
-| `BLLOG` | `/tmp/__bt_bl_9F3K.log` | Fichier des numéros de ligne (un par commande, car `LINENO` est cassé dans bashkit). |
+| `SEP` | `\x1e` (0x1E) | Préfixe de marqueur dans stdout/stderr. Non imprimable, quasi impossible à produire par accident. |
+| jeton | 16 hexadécimaux aléatoires par exécution | Empêche toute collision avec la sortie utilisateur. |
+| `LOG` | `/tmp/__bt_log_9F3K.log` | Instantanés de variables (un bloc par commande). |
+| `BLLOG` | `/tmp/__bt_bl_9F3K.log` | Ordre d'exécution : `B\|<seq>\|<id>` ; `T` en cas de troncature. |
 | `END` | `END` | Marqueur trailing (fin normale du script). |
 | `TRUNC` | `TRUNC` | Marqueur de tronquage (limite `maxSteps` atteinte). |
 
+`normalizeScript` retire le BOM et convertit les fins de ligne CRLF/CR en LF **avant** l'analyse : sans cela, un script récupéré sur Windows (`for …; do\r`) fait échouer le parseur de bashkit.
+
 ### `collectArrayNames`
 
-Avant l'instrumentation, on scanne le texte de chaque étape pour trouver les noms de tableaux/associatifs déclarés ou affectés (regex sur `name=(`), `name[`, `mapfile`, `read -a`, `declare -A`). Ces noms seront passés à la sonde `__bt_after` pour qu'elle émette `declare -p <nom>` en plus de `declare -p` (bare) — sinon les tableaux ne seraient pas capturés.
+Avant l'instrumentation, on scanne le texte de chaque étape pour trouver les noms de tableaux/associatifs déclarés ou affectés (regex sur `name=(`), `name[`, `mapfile`, `read -a`, `declare -A`). Ces noms sont passés à `__bt_after` pour qu'elle émette `declare -p <nom>` en plus de `declare -p` (bare) — sinon `declare -p` seul ne liste que les scalaires.
 
 ### `buildPrologue`
 
-Génère le préfixe qui définit les deux fonctions sonde :
+Génère le préfixe qui définit les deux fonctions sonde. Points importants :
+
+- `__bt_before` mémorise `$?` (`__bt_in`) et le **restitue** (`return $__bt_in`). Sans cela, la sonde écraserait le code de sortie et `if grep …; then` prendrait toujours la branche `then`.
+- `__bt_after` mémorise `$?` en premier, puis **le restitue** (`return $__bt_prev`).
+- Les marqueurs sont `\x1e<jeton>:<seq>:<id>` et sont émis sur stdout **et** stderr.
+- `$0`, `$#`, `$*` sont **reçus en arguments depuis le site d'appel** : dans bashkit, un appel de fonction met `$0` au nom de la fonction et `$#`/`$*` à ses arguments. Les lire dans la sonde donnerait `__bt_after|1|<id>`.
 
 ```bash
 __bt_before() {
+  __bt_in=$?
   __bt_count=$(( __bt_count + 1 ))
-  if [ "$__bt_count" -gt '200' ]; then        # garde anti-dépassement
-    printf '__BTM_9F3K__TRUNC\n'
-    printf '__BTM_9F3K__TRUNC\n' >&2
-    printf 'TRUNC\n' >> '/tmp/__bt_bl_9F3K.log'
-    exit 0                                    # stoppe l'exécution
+  __bt_seq=$(( __bt_seq + 1 ))
+  if [ "$__bt_count" -gt '200' ]; then
+    printf '\036<jeton>:TRUNC:TRUNC\n'
+    printf '\036<jeton>:TRUNC:TRUNC\n' >&2
+    printf 'T\n' >> '/tmp/__bt_bl_9F3K.log'
+    exit 0
   fi
-  printf '%s\n' "$1" >> '/tmp/__bt_bl_9F3K.log'   # journalise la ligne
+  printf 'B|%s|%s\n' "$__bt_seq" "$1" >> '/tmp/__bt_bl_9F3K.log'
+  return $__bt_in
 }
 __bt_after() {
-  __bt_prev=$?                                # code de sortie de la commande précédente
-  printf '__BTM_9F3K__%s\n' "$1"               # marqueur stdout (segmentation de sortie)
-  printf '__BTM_9F3K__%s\n' "$1" >&2           # marqueur stderr
-  printf 'M|%s|%s|%s|%s|%s|%s\n' "$1" "$__bt_prev" "$0" "$#" "$*" "$PWD" >> '/tmp/__bt_log_9F3K.log'
-  { declare -p; } >> '/tmp/__bt_log_9F3K.log' 2>> '/tmp/__bt_log_9F3K.log'  # scalaires
-  for __bt_n in <noms tableaux>; do declare -p "$__bt_n" >> '/tmp/__bt_log_9F3K.log' 2>> '/tmp/__bt_log_9F3K.log'; done  # tableaux
-  printf '___\n' >> '/tmp/__bt_log_9F3K.log'   # séparateur de bloc
+  __bt_prev=$?
+  printf '\036<jeton>:%s:%s\n' "$__bt_seq" "$1"
+  printf '\036<jeton>:%s:%s\n' "$__bt_seq" "$1" >&2
+  printf 'M|%s|%s|%s|%s|%s|%s|%s\n' "$__bt_seq" "$1" "$__bt_prev" "$2" "$3" "$PWD" "$4" >> '/tmp/__bt_log_9F3K.log'
+  { declare -p; } >> '/tmp/__bt_log_9F3K.log' 2>> '/tmp/__bt_log_9F3K.log'
+  for __bt_n in <noms tableaux>; do declare -p "$__bt_n" >> '/tmp/__bt_log_9F3K.log' 2>> '/tmp/__bt_log_9F3K.log'; done
+  printf '___\n' >> '/tmp/__bt_log_9F3K.log'
+  return $__bt_prev
 }
 __bt_count=0
-: > '/tmp/__bt_log_9F3K.log'                  # vide les journaux au départ
+__bt_seq=0
+: > '/tmp/__bt_log_9F3K.log'
 : > '/tmp/__bt_bl_9F3K.log'
 ```
 
 ### `instrument`
 
-Insère `__bt_before L; ` avant et `; __bt_after L` après chaque nœud-étape (où `L` = numéro de ligne, hardcodé depuis l'AST — aucune dépendance à `LINENO`).
+Insère `__bt_before <id>; ` avant et `; __bt_after <id> "$0" "$#" "$*"` après chaque nœud-étape. Aucun numéro de ligne n'est codé en dur : l'`id` renvoie au nœud AST, dont on relit `text`, `startLine` et `endLine`.
 
 ```text
   echo "x=$i"
   devient
-  __bt_before 5; echo "x=$i"; __bt_after 5
+  __bt_before 5; echo "x=$i"; __bt_after 5 "$0" "$#" "$*"
 ```
 
 Les insertions se font par offset, **en partant de la fin** (tri par `startIndex` décroissant) pour ne pas invalider les offsets précédents.
 
-Détail : le `; __bt_after L` (sans `; ` final) évite un double-point-virgule quand la commande est suivie d'un `;` dans la source (sinon `;;` ou `; ;`).
+Détail : le `; __bt_after …` (sans `; ` final) évite un double-point-virgule quand la commande est suivie d'un `;` dans la source (sinon `;;` ou `; ;`).
 
 ### Script final
 
 ```
-prologue + script instrumenté + "\n__bt_after END\n"
+prologue + script instrumenté + "\n__bt_after END \"$0\" \"$#\" \"$*\"\n"
 ```
 
-Le marqueur `__bt_after END` trailing indique une fin **normale**. Si le script appelle `exit`, ce marqueur n'est pas émis — c'est ce qui permet de détecter l'exit (voir plus bas).
+Le marqueur `END` trailing indique une fin **normale**. Si le script appelle `exit` (ou `exec`), ce marqueur n'est pas émis — c'est ce qui permet de détecter l'arrêt.
 
 ## Le moteur — exécution et reconstruction
 
@@ -172,27 +207,39 @@ Un seul appel : `bash.executeSync(full)`. On récupère :
 
 - `res.stdout` / `res.stderr` : contiennent les marqueurs et la sortie réelle.
 - `bash.readFile(LOG)` : le journal des instantanés de variables.
-- `bash.readFile(BLLOG)` : le journal des numéros de ligne.
+- `bash.readFile(BLLOG)` : l'ordre d'exécution et les ids de nœuds.
 - `res.exitCode` : code de sortie global.
 
-### Découpage
+### Découpage des sorties — `parseStream`
 
-1. **`splitByMarkers(stdout)`** — découpe stdout en segments séparés par les lignes `__BTM_9F3K__<marker>`. Chaque segment = sortie d'une commande. La sortie **avant** le premier marqueur (qui n'existe normalement pas car `__bt_before` précède chaque commande) est incluse via `push` à chaque marqueur rencontré.
+On cherche `\x1e<jeton>:` dans le flux. Le marqueur est émis **après** la commande : le texte compris entre le marqueur précédent et le marqueur courant est donc la sortie de la commande qui vient de se terminer. On le conserve **tel quel** (aucun `\n` ajouté), ce qui restitue exactement `printf "abc"` sans retour à la ligne. Les marqueurs `END` et `TRUNC` ne créent pas de segment ; le texte après le dernier marqueur (`tail`) appartient à une éventuelle commande interrompue.
 
-2. **`parseAfterBlock`** — pour chaque bloc du LOG (séparés par `___\n`) :
-   - Ligne d'en-tête `M|<line>|<exit>|<argv0>|<argc>|<argv>|<cwd>`.
-   - Lignes `declare …` (scalaires + tableaux).
-   - Construction de l'objet `{ line, exit, ctx, vars }` via `parseDeclareP` + `filterUserVars`.
+### Journal des états — `parseAfterBlock`
 
-3. **Appariement direct** : l'étape *k* = bloc *k* (état après la commande *k*) = segment stdout *k* (sortie de la commande *k*). C'est possible parce que `__bt_after` émet le marqueur **après** la commande, donc le segment *k* contient la sortie produite entre le marqueur *k-1* et le marqueur *k*.
+Chaque bloc du LOG (séparés par `___\n`) contient :
 
-### Cas particulier : `exit`
+- une ligne `M|<seq>|<id>|<exit>|<argv0>|<argc>|<cwd>|<argv>` (`argv` en dernier pour pouvoir contenir des `|`) ;
+- des lignes `declare …` (scalaires + tableaux).
 
-Si le script appelle `exit N`, le marqueur `__bt_after END` n'est pas émis (l'exécution s'arrête avant). On détecte alors l'absence de `END` (et de `TRUNC`) et on **synthétise** une étape finale :
+On construit `{ seq, id, exit, ctx, vars }` via `parseDeclareP` + `filterUserVars`.
 
-- La ligne vient du fichier BLLOG (l'entrée correspondant à la commande `exit` — `__bt_before` a eu le temps de journaliser la ligne avant l'exit).
-- Le code de sortie vient de `res.exitCode`.
-- Les variables/ctx viennent du dernier bloc capturé (avant l'exit).
+### Reconstruction
+
+1. `parseBeforeLog(BLLOG)` donne la suite ordonnée `{ seq, id }` des commandes réellement exécutées (y compris celle qui a provoqué un `exit`).
+2. `blockBySeq`, `outBySeq`, `errBySeq` indexent blocs et segments par `seq`.
+3. `metaById` associe chaque `id` au nœud AST (texte, lignes).
+4. On itère sur l'ordre : `step = { text, startLine, endLine, kind, stdout, stderr, exitCode, vars, ctx, … }`.
+
+L'utilisation de `seq` (et non de l'index du tableau) est ce qui rend l'appariement fiable même quand une boucle réexécute le même nœud.
+
+### Cas particulier : `exit` / `exec`
+
+Si une entrée de BLLOG n'a **pas** de bloc LOG correspondant, la commande a interrompu le shell. On synthétise l'étape finale :
+
+- `text` / lignes viennent du nœud AST (via l'id) ;
+- le code de sortie vient de `res.exitCode` ;
+- les variables/contexte viennent de la dernière étape complète ;
+- `stdout`/`stderr` viennent du `tail` du flux.
 
 ### Tronquage
 
@@ -209,15 +256,17 @@ declare -- x="5"
 declare -a arr=("a" "b" "c")
 declare -A m=([k]="v" [w]="z")
 declare -ir n="42"
+declare -- t=$'a\tb'
 ```
 
 On parse chaque ligne :
 
 - Flags : `--` (rien), `-a` (tableau indexé), `-A` (associatif), `-i` (entier), `-r` (readonly), `-x` (exporté).
 - Valeur :
-  - **string** : décodage des échappements (`\"`, `\n`, `\xNN`, `\uNNNN`…).
-  - **array** : paires `[index]="valeur"` triées par index numérique.
-  - **assoc** : paires `[clé]="valeur"` (non triées, ordre d'insertion).
+  - **string** : décodage des échappements (`\"`, `\n`, `\xNN`, `\uNNNN`…), y compris la forme ANSI-C `$'…'`.
+  - **array** : paires `[index]="valeur"` triées par index numérique (tableau vide → `[]`).
+  - **assoc** : paires `[clé]="valeur"` (ordre d'insertion).
+  - déclaration sans `=` : valeur vide.
 
 ### Filtrage
 
@@ -237,69 +286,82 @@ run(code) → runScript(code) → { steps, truncated, error? }
               ┌───────────────┬───────────┴───────────┬──────────────────┐
               ▼               ▼                       ▼                  ▼
         renderCode      renderVariables         renderContext       renderOutput
-   (surligne ligne)   (diff vs étape N-1)    ($PWD, $0, $?, …)   (chunks stdout/stderr)
+   (ligne courante +   (diff vs étape N-1)    ($PWD, $0, $?, …)   (chunks stdout/stderr)
+    lignes cliquables)
 ```
+
+`render()` met aussi à jour la barre d'explication (`renderExplanation`) et surligne la ligne courante **dans l'éditeur CodeMirror** (`highlightLines`, décorations `cm-current-line` / `cm-error-line`).
 
 ### Diff de variables (src/diff.js)
 
-`computeVarDiff(prevVars, nextVars)` compare les signatures `JSON.stringify([kind, value])` pour classer les variables en `added` / `changed` / `removed`. Les classes CSS `added` (vert) / `changed` (jaune) / `removed` (rouge barré) sont appliquées dans `renderVariables`.
+`computeVarDiff(prevVars, nextVars)` compare les signatures `JSON.stringify([kind, value])` pour classer les variables en `added` / `changed` / `removed`. Les classes CSS `added` (vert) / `changed` (jaune) / `removed` (rouge) sont appliquées dans `renderVariables`.
+
+`renderExplanation` réutilise ce diff pour produire une phrase courte (« `somme` : "0" → "1" », « condition vraie »).
 
 ### Code view
 
-`renderCode` génère un `<div class="line">` par ligne, avec `.current` sur la/les ligne(s) de l'étape. Auto-scroll centré. `renderCurrentStmt` affiche le texte de la commande courante dans une bande en bas du panneau.
+`renderCode` génère un `<div class="line">` par ligne et met la classe `.current` sur la plage `startLine..endLine` de l'étape. Le rendu est mis en cache par script (`container.dataset.script`) : la navigation ne reconstruit pas le DOM. Seuls les numéros de ligne correspondant à une étape sont cliquables (saut direct).
 
 ### Contrôles (src/ui/controls.js)
 
-Navigation : premier / précédent / suivant / dernier + lecture auto (setTimeout récursif avec vitesse réglable). Le compteur `N / total` et la désactivation des boutons aux extrémités sont gérés par `setSteps`.
+Navigation : premier / précédent / suivant / dernier, curseur (`input[type=range]`), lecture auto (setTimeout récursif avec vitesse réglable). Le compteur `N / total` et la désactivation des boutons aux extrémités sont gérés par `setSteps`.
 
 ### Navigation clavier
 
-`ArrowLeft` / `ArrowRight` appellent `goBack` / `goNext`, sauf si le focus est dans l'éditeur CodeMirror (`.cm-content`) — pour ne pas interférer avec l'édition.
+- `←` / `→` : étape précédente / suivante.
+- `Début` / `Fin` : première / dernière étape.
+- `Échap` : arrête la lecture.
+- `Ctrl+Entrée` / `Cmd+Entrée` : relance l'exécution.
+- Dans l'éditeur ou un champ, les flèches gardent leur rôle d'édition.
+
+### Thème, permalien, persistance
+
+- Thème clair/sombre : `data-theme` sur `<html>`, mémorisé dans `localStorage` (`bashtutor.theme`) ; CodeMirror bascule via `@codemirror/theme-one-dark`.
+- Permalien : le script est encodé en base64 URL-safe dans `#code=…` (`history.replaceState` à chaque exécution). Un lien ouvert dans un onglet neuf charge et exécute le script ; un changement de hash dans l'onglet courant est aussi pris en compte.
+- `localStorage` (`bashtutor.code`) : sauvegarde différée pendant l'édition, restaurée au chargement si aucun `#code=`.
 
 ## Diagramme de flux de données complet
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │ 1. PARSER                                                           │
-│    script → tree-sitter → AST → findStepNodes → steps[] (offsets)   │
+│    normalizeScript(CRLF/BOM) → tree-sitter → findStepNodes           │
+│    → steps[] { id, kind, text, startLine, endLine, offsets }         │
 │    + firstErrorLine (si syntax error → return tôt)                  │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 2. INSTRUMENT                                                       │
 │    collectArrayNames(steps) → noms de tableaux                      │
-│    buildPrologue(maxSteps, noms) → définition des sondes            │
-│    instrument(script, steps) → script avec __bt_before/after        │
-│    full = prologue + instrumenté + "\n__bt_after END\n"             │
+│    buildPrologue(maxSteps, noms, jeton) → définition des sondes     │
+│    instrument(script, steps) → __bt_before/after <id>               │
+│    full = prologue + instrumenté + "\n__bt_after END …\n"           │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 3. EXECUTE                                                          │
-│    bash.executeSync(full) → { stdout, stderr, exitCode }           │
-│    bash.readFile(LOG) → logContent (blocs séparés par ___)         │
-│    bash.readFile(BLLOG) → blContent (lignes)                      │
+│    bash.executeSync(full) → { stdout, stderr, exitCode }            │
+│    bash.readFile(LOG) → blocs d'état séparés par ___                │
+│    bash.readFile(BLLOG) → ordre { seq, id }                          │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 4. RECONSTRUCT                                                      │
-│    splitByMarkers(stdout) → outSegs (segments par commande)        │
-│    splitByMarkers(stderr) → errSegs                                 │
-│    logContent.split("___\n").map(parseAfterBlock) → afterBlocks    │
-│    afterBlocks.filter(line !== null) → cmdBlocks (état par étape)   │
-│    blContent.split("\n") → blLines (ligne par commande)           │
+│    parseStream(stdout, jeton) → segments { seq, payload }           │
+│    parseStream(stderr, jeton) → segments + tail                     │
+│    parseBeforeLog(BLLOG) → entries ordonnées                        │
+│    parseAfterBlock(bloc) → { seq, id, exit, ctx, vars }             │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 5. PAIR                                                             │
-│    for k in 0..cmdBlocks.length:                                    │
-│      step[k] = {                                                    │
-│        line: cmdBlocks[k].line,                                     │
-│        vars: cmdBlocks[k].vars,  (état APRÈS commande k)           │
-│        stdout: outSegs[k].text,  (sortie DE commande k)            │
-│        stderr: errSegs[k].text,                                     │
-│        exitCode: cmdBlocks[k].exit,                                 │
-│        text: sourceLines[line],                                     │
-│        cumulativeStdout: cumul, ...                                 │
+│    for entry of entries:                                            │
+│      meta = metaById[entry.id]                                      │
+│      block = blockBySeq[entry.seq]                                  │
+│      step = {                                                       │
+│        text: meta.text, startLine/endLine: meta.*, kind: meta.kind, │
+│        vars: block.vars, ctx: block.ctx, exitCode: block.exit,      │
+│        stdout: outBySeq[entry.seq], stderr: errBySeq[entry.seq],    │
+│        cumulativeStdout: cumul, …                                   │
 │      }                                                              │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 6. EXIT HANDLING                                                    │
-│    if !hasEnd && !hasTrunc:                                         │
-│      synthétise étape finale depuis blLines[k] + execExit           │
+│    entrée sans bloc LOG → synthèse avec tail + execExit + étape N-1 │
 ├─────────────────────────────────────────────────────────────────────┤
 │ 7. RETURN                                                           │
-│    { steps: result, truncated: hasTrunc }                           │
+│    { steps: result, truncated }                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -307,5 +369,6 @@ Navigation : premier / précédent / suivant / dernier + lecture auto (setTimeou
 
 - **Fonctions atomiques** : un appel `mafonction args` est une étape (le corps n'est pas détaillé). Sinon `r=$(mafonction)` polluerait `r` avec les marqueurs.
 - **Subshells non instrumentés** : `$(…)`, `<(…)`, `( … )` ne produisent pas de pas à pas interne.
+- **Listes `&&` / `||` atomiques** : `a && b` est une étape (le découpage casserait le court-circuit).
 - **Pas de `read` interactif** : bashkit ne gère pas l'entrée interactive.
 - **Commandes externes** : limitées aux builtins de bashkit. `cat`, `sort`, `tr`, `grep`, `wc`, `seq`, `mapfile` fonctionnent car implémentés dans bashkit ; d'autres binaires externes peuvent ne pas être disponibles.
