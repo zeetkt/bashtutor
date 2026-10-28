@@ -21,3 +21,6 @@ Thumbs.db
 # Temp / probes
 probe_*.mjs
 probe_*.sh
+
+# Tests navigateur
+.playwright-mcp/
