@@ -43,6 +43,7 @@ function unescape(str) {
 }
 
 function parseQuotedValue(v) {
+  if (v.startsWith("$'") || v.startsWith('$"')) return unescape(v.slice(2, -1));
   if (v.startsWith('"')) return unescape(v.slice(1, -1));
   return v;
 }
@@ -58,21 +59,21 @@ function parsePairs(body) {
 }
 
 function parseDeclareLine(line) {
-  const m = /^declare\s+(-[A-Za-z]+|--)\s+([^=]+)=(.*)$/.exec(line);
+  const m = /^declare\s+(-[A-Za-z]+|--)\s+([^=\s]+)(?:=(.*))?$/.exec(line);
   if (!m) return null;
   const flags = m[1];
-  const name = m[2].trim();
-  const raw = m[3];
+  const name = m[2];
+  const raw = m[3] ?? "";
   let kind = "string";
   if (flags.includes("a")) kind = "array";
   else if (flags.includes("A")) kind = "assoc";
   else if (flags.includes("i")) kind = "int";
   let value;
   if (kind === "array") {
-    value = parsePairs(raw.slice(1, -1));
+    value = raw ? parsePairs(raw.slice(1, -1)) : [];
     value.sort((a, b) => Number(a[0]) - Number(b[0]));
   } else if (kind === "assoc") {
-    value = parsePairs(raw.slice(1, -1));
+    value = raw ? parsePairs(raw.slice(1, -1)) : [];
   } else {
     value = parseQuotedValue(raw);
   }

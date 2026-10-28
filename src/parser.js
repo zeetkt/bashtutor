@@ -34,19 +34,49 @@ const SKIP_TYPES = new Set([
   "subshell",
 ]);
 
+const CONDITION_PARENTS = new Map([
+  ["if_statement", "condition"],
+  ["elif_clause", null],
+  ["while_statement", "condition"],
+]);
+
+function conditionNode(parent) {
+  if (parent.type === "elif_clause") return parent.namedChildren[0] ?? null;
+  return parent.childForFieldName(CONDITION_PARENTS.get(parent.type));
+}
+
+function stepNode(node, kind) {
+  return {
+    startIndex: node.startIndex,
+    endIndex: node.endIndex,
+    startLine: node.startPosition.row,
+    endLine: node.endPosition.row,
+    type: node.type,
+    kind,
+    text: node.text,
+  };
+}
+
 function walkSteps(node, out) {
   if (SKIP_TYPES.has(node.type)) return;
-  if (STEP_TYPES.has(node.type)) {
-    out.push({
-      startIndex: node.startIndex,
-      endIndex: node.endIndex,
-      startLine: node.startPosition.row,
-      endLine: node.endPosition.row,
-      type: node.type,
-    });
+
+  const conditionField = CONDITION_PARENTS.get(node.type);
+  if (conditionField !== undefined) {
+    const condition = conditionNode(node);
+    if (condition) out.push(stepNode(condition, "condition"));
+    for (const child of node.namedChildren) {
+      if (condition && child.equals(condition)) continue;
+      walkSteps(child, out);
+    }
     return;
   }
-  for (const c of node.namedChildren) walkSteps(c, out);
+
+  if (STEP_TYPES.has(node.type)) {
+    out.push(stepNode(node, "command"));
+    return;
+  }
+
+  for (const child of node.namedChildren) walkSteps(child, out);
 }
 
 export function findStepNodes(script) {
@@ -54,30 +84,10 @@ export function findStepNodes(script) {
   const root = tree.rootNode;
   const steps = [];
   walkSteps(root, steps);
+  steps.forEach((step, index) => {
+    step.id = index;
+  });
   return { steps, hasError: root.hasError };
-}
-
-export function splitTopLevel(script) {
-  const tree = parser.parse(script);
-  const root = tree.rootNode;
-  const nodes = [];
-  (function collect(n) {
-    if (n.type === "comment") return;
-    if (n.type === "program" || n.type === "translation_unit") {
-      for (const c of n.namedChildren) collect(c);
-      return;
-    }
-    nodes.push(n);
-  })(root);
-  return {
-    hasError: root.hasError,
-    statements: nodes.map((n) => ({
-      text: n.text,
-      startLine: n.startPosition.row,
-      endLine: n.endPosition.row,
-      type: n.type,
-    })),
-  };
 }
 
 export function firstErrorLine(script) {
